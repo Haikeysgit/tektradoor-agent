@@ -1,0 +1,9 @@
+# The agent runs the judge's own code, so it pins the same libraries as the
+# judge (vendor/tektradoor-judge/requirements.txt). tests/test_judge_link.py
+# checks the pins match.
+pandas
+numpy
+requests
+pytest
+# judge.judge imports judge.stamp, which needs it.
+opentimestamps-client

@@ -16,5 +16,6 @@ def test_clean_list_passes():
 
 
 def test_windows_separators_and_other_patterns():
-    paths = ["a\.env.local", "certs\site.pem", "k\ssh-key.key", "a\.env.example", ".env.example"]
-    assert find_forbidden(paths) == ["a\.env.local", "certs\site.pem", "k\ssh-key.key"]
+    paths = ["a\\.env.local", "certs\\site.pem", "k\\ssh-key.key", "a\\.env.example", ".env.example"]
+    assert find_forbidden(paths) == ["a\\.env.local", "certs\\site.pem", "k\\ssh-key.key"]
+

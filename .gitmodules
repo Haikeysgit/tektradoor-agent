@@ -1,0 +1,3 @@
+[submodule "vendor/tektradoor-judge"]
+	path = vendor/tektradoor-judge
+	url = https://github.com/Haikeysgit/tektradoor-judge.git

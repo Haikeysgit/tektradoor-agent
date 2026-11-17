@@ -55,17 +55,18 @@ def judge_view(prereg: dict, close, qv, funding, win):
 
 @pytest.fixture(scope="module", params=["01-zarattini-long.json", "02-zarattini-long-short.json"])
 def both(request):
-    prereg = load_prereg(PREREG_DIR / request.param)
+    path = PREREG_DIR / request.param
+    prereg = load_prereg(path).rules
     win = (syn.WINDOW_START, syn.WINDOW_END)
     judge = judge_view(prereg, *syn.judge_load(), win)
     # The agent gets the whole 900-day panel and must cut it where the judge loads.
-    account = replay_frames(prereg, *syn.panel(), syn.WINDOW_START, syn.WINDOW_END)
+    account = replay_frames(path, *syn.panel(), syn.WINDOW_START, syn.WINDOW_END)
     return prereg, judge, account
 
 
 def _agent_returns(account) -> pd.Series:
-    days = pd.DatetimeIndex([pd.Timestamp(d) for d, _ in account.equity_history])
-    equity = pd.Series([v for _, v in account.equity_history], index=days)
+    days = pd.DatetimeIndex([pd.Timestamp(m.day) for m in account.equity_history])
+    equity = pd.Series([m.equity for m in account.equity_history], index=days)
     return (equity / equity.shift(1) - 1.0).iloc[1:]
 
 
@@ -86,6 +87,16 @@ def test_trade_costs_match_the_judge(both):
     ours = sum(t.cost for t in account.trade_log if t.day < syn.WINDOW_END)
     assert cost_usd > 0
     assert abs(ours - cost_usd) <= TOL * 10_000.0, (ours, cost_usd)
+
+
+def test_daily_components_add_up_and_costs_match_the_judge(both):
+    _, (_, cost_usd, _, _), account = both
+    marks = account.equity_history
+    for prev, m in zip(marks, marks[1:]):
+        assert abs((m.equity - prev.equity) - (m.price_pnl + m.funding_pnl - m.costs)) <= 1e-9, m.day
+    assert sum(m.funding_pnl for m in marks) != 0.0
+    # The marks' costs are the judge's cost component, day by day.
+    assert abs(sum(m.costs for m in marks) - cost_usd) <= TOL * 10_000.0
 
 
 def test_final_equity_is_the_judges_total_return(both):

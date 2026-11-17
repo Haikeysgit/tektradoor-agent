@@ -17,7 +17,7 @@ from datetime import date
 from pathlib import Path
 
 from agent import replay as replay_mod
-from agent.judge_link import J, JudgeTreeMismatch
+from agent.judge_link import J, VerificationError
 from agent.step import StepError
 from judge import data as judge_data
 
@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     except J.DataNotReady as exc:
         print(f"data error: {exc}", file=sys.stderr)
         return 3
-    except (J.JudgeRefusal, JudgeTreeMismatch, StepError, ValueError) as exc:
+    except (J.JudgeRefusal, VerificationError, StepError, ValueError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     except (judge_data.DataIntegrityError, judge_data.ArchiveFetchError, judge_data.MissingArchiveFile,

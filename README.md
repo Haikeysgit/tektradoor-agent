@@ -16,9 +16,15 @@ database yet.
   does not reimplement any formula: universe, daily exit check, Donchian
   target weights, the rebalance threshold, costs and funding are the judge's
   functions, called on the price history up to each day's close.
-- Before running a prereg, the agent checks that its `judge_tree_hash` equals
-  `git -C vendor/tektradoor-judge rev-parse HEAD:judge` and that the judge
-  code has no local changes. Otherwise it refuses.
+- The agent runs registered rules only: a prereg must be a file in
+  `vendor/tektradoor-judge/prereg/` that passes the judge's own integrity
+  check (committed once, matching its registered sha256 and the judge tree
+  hash). The account stores the prereg's sha256 and the judge tree hash, and
+  every daily step re-hashes the prereg, re-reads
+  `git -C vendor/tektradoor-judge rev-parse HEAD:judge` and refuses if either
+  differs or the vendored judge has local changes.
+- Each daily step needs one row for every day from the account's data start
+  to that day's close, and nothing later.
 - `tests/test_replay_matches_judge.py` steps the agent day by day over a
   synthetic market and checks that its daily equity returns equal the judge's
   daily net returns (within 1e-10, every day) and that its trade costs equal

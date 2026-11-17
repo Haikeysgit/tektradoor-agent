@@ -1,20 +1,28 @@
-"""The link to the judge: import path and the startup check.
+"""The link to the judge: import path, registered preregs and the per-step check.
 
 The judge (github.com/Haikeysgit/tektradoor-judge) is a git submodule at
 vendor/tektradoor-judge. It is not installed; its directory goes first on
 sys.path so ``import judge`` loads the vendored code and nothing else.
 
-Startup check: a prereg's ``judge_tree_hash`` (the git tree of judge/ when the
-rules were registered) must equal ``git -C vendor/tektradoor-judge rev-parse
-HEAD:judge``, and judge/ must have no uncommitted changes. Otherwise the agent
-refuses to run that prereg: the code that would trade is not the code that
-was judged.
+The agent runs registered rules only:
+
+* ``load_prereg`` accepts a prereg only from vendor/tektradoor-judge/prereg/
+  and only if the judge's own ``check_integrity`` passes (committed once,
+  bytes equal the commit, sha256 equals the .sha256 registration, its
+  judge_tree_hash equals HEAD:judge, nothing uncommitted under judge/ or
+  prereg/). The account stores the prereg's sha256 and the judge tree hash.
+* ``verify_step`` runs before every daily step: it re-hashes the prereg file,
+  re-reads ``git rev-parse HEAD:judge`` and ``git status`` in the submodule
+  (nothing is cached) and refuses unless both hashes equal the account's and
+  judge/ and prereg/ are clean. The rules come from the bytes just hashed.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 import sys
-from functools import lru_cache
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,11 +40,33 @@ import judge  # noqa: E402
 if Path(judge.__file__).resolve().parent != (VENDOR / "judge").resolve():
     raise ImportError(f"judge was imported from {judge.__file__}, not from {VENDOR / 'judge'}")
 
-from judge import judge as J  # noqa: E402,F401  (the judge's run() module)
+from judge import judge as J  # noqa: E402  (the judge's run() module)
 
 
-class JudgeTreeMismatch(RuntimeError):
+class VerificationError(RuntimeError):
+    """The agent cannot prove it would run registered rules on the judged code."""
+
+
+class JudgeTreeMismatch(VerificationError):
     """The vendored judge code is not the code the prereg was registered with."""
+
+
+class PreregNotRegistered(VerificationError):
+    """The prereg is not a registered, unedited prereg of the vendored judge."""
+
+
+@dataclass(frozen=True)
+class Registered:
+    """A prereg that passed the judge's integrity check."""
+
+    path: Path
+    rules: dict
+    sha256: str  # of the committed (= working) file bytes, as in its .sha256 registration
+    judge_tree_hash: str  # git rev-parse HEAD:judge in the submodule
+
+
+def _vendor() -> Path:
+    return Path(VENDOR).resolve()  # read at call time (tests point it at a clone)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -46,36 +76,57 @@ def _git(repo: Path, *args: str) -> str:
     return res.stdout.strip()
 
 
-@lru_cache(maxsize=None)
-def _tree_state(repo: str) -> tuple[str, str]:
-    """(HEAD:judge tree hash, porcelain status of judge/). Read once per process."""
-    path = Path(repo)
-    tree = _git(path, "rev-parse", "HEAD:judge")
-    dirty = _git(path, "status", "--porcelain", "--untracked-files=all", "--", "judge")
-    return tree, dirty
+def vendor_tree_hash() -> str:
+    """``git -C vendor/tektradoor-judge rev-parse HEAD:judge``, read fresh each call."""
+    return _git(_vendor(), "rev-parse", "HEAD:judge")
 
 
-def vendor_tree_hash(repo: Path = VENDOR) -> str:
-    """``git -C <repo> rev-parse HEAD:judge``."""
-    return _tree_state(str(Path(repo).resolve()))[0]
+def _registered_path(path: Path) -> Path:
+    path = Path(path).resolve()
+    home = _vendor() / "prereg"
+    if path.parent != home:
+        raise PreregNotRegistered(f"{path}: the agent runs only registered preregs, from {home}")
+    return path
 
 
-def check_judge_tree(prereg: dict, repo: Path = VENDOR) -> None:
-    """Refuse (JudgeTreeMismatch) unless the prereg was registered against this judge code."""
-    tree, dirty = _tree_state(str(Path(repo).resolve()))
-    name = prereg.get("candidate_id", "prereg")
-    want = prereg.get("judge_tree_hash")
-    if want != tree:
+def load_prereg(path: Path) -> Registered:
+    """Accept only a registered prereg of the vendored judge (the judge's check_integrity)."""
+    path = _registered_path(path)
+    try:
+        J.check_integrity(path)
+        rules = J.load_prereg(path)
+        sha = J.committed_sha256(path)
+    except J.JudgeRefusal as exc:
+        raise PreregNotRegistered(f"{path.name} is not a registered, unedited prereg: {exc}") from exc
+    return Registered(path=path, rules=rules, sha256=sha, judge_tree_hash=vendor_tree_hash())
+
+
+def verify_step(path: Path, prereg_sha256: str, judge_tree_hash: str) -> dict:
+    """Re-check before a step and return the rules read from the bytes just hashed.
+
+    Refuses unless the prereg is the vendored file, its sha256 equals
+    ``prereg_sha256``, HEAD:judge equals ``judge_tree_hash`` (and the prereg's
+    own field), and nothing is uncommitted under judge/ or prereg/.
+    """
+    path = _registered_path(path)
+    raw = path.read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha != prereg_sha256:
+        raise PreregNotRegistered(f"{path.name}: sha256 is {sha}, the account was opened on {prereg_sha256}")
+    tree = vendor_tree_hash()
+    if tree != judge_tree_hash:
         raise JudgeTreeMismatch(
-            f"{name}: judge_tree_hash {want} does not match the vendored judge "
-            f"(git -C {repo} rev-parse HEAD:judge = {tree}); refusing to run rules on other code"
+            f"vendored judge HEAD:judge is {tree}, the account's judge_tree_hash is {judge_tree_hash}; "
+            "refusing to run rules on other code"
         )
+    dirty = _git(_vendor(), "status", "--porcelain", "--untracked-files=all", "--", "judge", "prereg")
     if dirty:
-        raise JudgeTreeMismatch(f"{name}: uncommitted changes under {repo}/judge: {dirty.splitlines()}")
-
-
-def load_prereg(path: Path) -> dict:
-    """Read a prereg with the judge's own validation, then run the startup check."""
-    prereg = J.load_prereg(Path(path))
-    check_judge_tree(prereg)
-    return prereg
+        raise JudgeTreeMismatch(f"uncommitted changes in the vendored judge: {dirty.splitlines()}")
+    rules = json.loads(raw)
+    missing = [k for k in J.REQUIRED_KEYS if k not in rules]
+    if missing:
+        raise PreregNotRegistered(f"{path.name}: missing required key(s): {', '.join(missing)}")
+    J._validate(rules, path.name)
+    if rules["judge_tree_hash"] != tree:
+        raise JudgeTreeMismatch(f"{path.name}: judge_tree_hash {rules['judge_tree_hash']} is not HEAD:judge {tree}")
+    return rules

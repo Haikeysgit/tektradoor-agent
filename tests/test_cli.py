@@ -48,11 +48,11 @@ def test_replay_cli_refuses_data_that_ends_early(monkeypatch, capsys):
     assert "before the window end" in capsys.readouterr().err
 
 
-def test_replay_cli_refuses_a_bad_prereg(tmp_path, capsys):
+def test_replay_cli_refuses_an_unregistered_prereg(tmp_path, capsys):
     raw = json.loads(PREREG.read_text(encoding="utf-8"))
-    raw["judge_tree_hash"] = "a" * 40
-    bad = tmp_path / "01-other.json"
+    raw["lookbacks"] = [5, 10]  # edited rules, same judge_tree_hash
+    bad = tmp_path / "01-zarattini-long.json"
     bad.write_text(json.dumps(raw), encoding="utf-8")
     code = main(["replay", str(bad), "--start", "2025-03-26", "--end", "2025-03-30"])
     assert code == 2
-    assert "judge_tree_hash" in capsys.readouterr().err
+    assert "registered" in capsys.readouterr().err

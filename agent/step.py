@@ -15,7 +15,14 @@ Every formula is the judge's own code, called on the history up to ``day``:
   second row is the judge's own loop step;
 * the mark: ``judge.costs.net_returns`` on the book's last two executed weight
   rows, which gives the judge's net return for ``day`` (price change, the cost
-  of the last close's trades, funding).
+  of the last close's trades, funding). Calling it again without funding, and
+  without funding or costs, splits that return into its parts.
+
+Before any of this, ``judge_link.verify_step`` re-hashes the prereg file and
+re-reads the vendored judge's tree hash and status, and refuses unless they
+are the ones the account was opened on. The rules come from the bytes it
+hashed. The frames must hold every day from the account's data start to
+``day`` (the judge's windows count rows), with identical indexes.
 
 All the judge's functions are causal (each row reads only earlier rows), so
 their row for ``day`` on history cut at ``day`` equals the row ``run()`` gets
@@ -28,8 +35,8 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from agent.account import Account, Trade
-from agent.judge_link import J, check_judge_tree
+from agent.account import Account, Mark, Trade
+from agent.judge_link import J, verify_step
 from judge.costs import _executed_weights, net_returns
 from judge.strategies.donchian import portfolio_weights
 
@@ -43,11 +50,7 @@ class LookAheadError(StepError):
 
 
 def _rules(prereg: dict) -> dict:
-    """The prereg's rules, validated by the judge, with the judge's fixed JUDGING values."""
-    missing = [k for k in J.REQUIRED_KEYS if k not in prereg]
-    if missing:
-        raise J.PreregError(f"prereg missing required key(s): {', '.join(missing)}")
-    J._validate(prereg, prereg["candidate_id"])
+    """The prereg's rules (validated by verify_step) with the judge's fixed JUDGING values."""
     return {
         "long_short": prereg["long_short"],
         "lookbacks": tuple(prereg["lookbacks"]),
@@ -64,18 +67,29 @@ def _rules(prereg: dict) -> dict:
 def _check_frames(close, quote_volume, funding, account: Account, day: date) -> None:
     ts = pd.Timestamp(day)
     first = pd.Timestamp(account.data_start)
+    expected = pd.date_range(first, ts, freq="D")
     for name, frame in (("close", close), ("quote_volume", quote_volume), ("funding", funding)):
         if frame is None and name == "funding":
             continue
         idx = frame.index
-        if len(idx) == 0 or not idx.is_monotonic_increasing or idx[-1] != ts:
-            last = idx[-1].date() if len(idx) else None
+        if len(idx) == 0 or idx.max() != ts or idx[-1] != ts:
+            last = idx.max().date() if len(idx) else None
             raise LookAheadError(f"{name} must end at {day}'s close (no look-ahead); it ends at {last}")
         if idx[0] != first:
             raise StepError(
                 f"{name} must start at the account's data_start {account.data_start} "
                 f"(where the judge starts loading); it starts at {idx[0].date()}"
             )
+        if not idx.equals(expected):
+            raise StepError(
+                f"{name} must have one row for every day from data_start {account.data_start} to {day}, "
+                f"in order (the judge's windows count rows); it has {len(idx)} rows for {len(expected)} days"
+            )
+    held = set(account.weights) | set(account.prev_weights)
+    for name, frame in (("close", close), ("funding", funding)):
+        missing = sorted(held - set(frame.columns)) if frame is not None else []
+        if missing:
+            raise StepError(f"held or just-sold coins missing from {name}: {missing}")
 
 
 def _check_day(account: Account, day: date) -> None:
@@ -86,19 +100,34 @@ def _check_day(account: Account, day: date) -> None:
         raise StepError(f"the next step must be the next day {account.last_day + timedelta(days=1)}, got {day}")
 
 
-def _mark(account: Account, close, funding, day: date, cost: float) -> float:
-    """The judge's net return for ``day`` on the book's executed weights."""
+def _mark(account: Account, close, funding, day: date, cost: float) -> Mark:
+    """The book at ``day``'s close: the judge's net return for ``day``, split.
+
+    net = net_returns(..., funding, cost); without funding it is gross - cost;
+    without funding and cost it is the gross price return. Equity compounds on
+    net exactly; the parts are the differences, in USD on the previous mark.
+    """
+    prev_equity = account.equity
     coins = [c for c in close.columns if c in account.weights or c in account.prev_weights]
     if not coins:
-        return 0.0
+        return Mark(day, prev_equity, 0.0, 0.0, 0.0)
     t = pd.Timestamp(account.last_day)
     idx = pd.DatetimeIndex([t - pd.Timedelta(days=1), t, pd.Timestamp(day)])
     prev = pd.Series(account.prev_weights, dtype=float).reindex(coins, fill_value=0.0)
     cur = pd.Series(account.weights, dtype=float).reindex(coins, fill_value=0.0)
     weights = pd.DataFrame([prev.to_numpy(), cur.to_numpy(), cur.to_numpy()], index=idx, columns=coins)
     flags = pd.DataFrame(True, index=idx, columns=coins)
-    net = net_returns(weights, flags, close, funding, cost, rebalance_threshold=None)
-    return float(net.loc[pd.Timestamp(day)])
+    ts = pd.Timestamp(day)
+    net = float(net_returns(weights, flags, close, funding, cost, rebalance_threshold=None).loc[ts])
+    no_funding = float(net_returns(weights, flags, close, None, cost, rebalance_threshold=None).loc[ts])
+    gross = float(net_returns(weights, flags, close, None, 0.0, rebalance_threshold=None).loc[ts])
+    return Mark(
+        day=day,
+        equity=prev_equity * (1.0 + net),
+        price_pnl=prev_equity * gross,
+        funding_pnl=prev_equity * (net - no_funding),
+        costs=prev_equity * (gross - no_funding),
+    )
 
 
 def _decide(rules: dict, close, quote_volume, account: Account, day: date) -> pd.Series:
@@ -125,27 +154,28 @@ def _decide(rules: dict, close, quote_volume, account: Account, day: date) -> pd
     return _executed_weights(two, flags, rules["threshold"]).loc[ts]
 
 
-def daily_step(prereg: dict, close, quote_volume, funding, account: Account, day: date) -> tuple[Account, list[Trade]]:
+def daily_step(prereg, close, quote_volume, funding, account: Account, day: date) -> tuple[Account, list[Trade]]:
     """Mark the book at ``day``'s close and trade to that close's decision.
 
+    prereg: the path of the account's registered prereg under
+    vendor/tektradoor-judge/prereg/ (or the ``Registered`` from load_prereg).
+    It is re-verified against the account on every call.
     close, quote_volume, funding: the judge's panel frames (dates x symbols),
-    from ``account.data_start`` up to and including ``day``, nothing later.
+    one row per day from ``account.data_start`` to ``day``, nothing later.
     Returns a new Account and the day's trades; ``account`` is not changed.
     """
-    if prereg.get("candidate_id") != account.candidate_id:
-        raise StepError(f"prereg candidate {prereg.get('candidate_id')!r} is not this account's {account.candidate_id!r}")
-    rules = _rules(prereg)
-    check_judge_tree(prereg)
+    raw = verify_step(getattr(prereg, "path", prereg), account.prereg_sha256, account.judge_tree_hash)
+    if raw["candidate_id"] != account.candidate_id:
+        raise StepError(f"prereg candidate {raw['candidate_id']!r} is not this account's {account.candidate_id!r}")
+    rules = _rules(raw)
     _check_frames(close, quote_volume, funding, account, day)
     _check_day(account, day)
-    missing = sorted(set(account.weights) - set(close.columns))
-    if missing:
-        raise StepError(f"held coins missing from the price data: {missing}")
 
     if account.last_day is None:
-        mark = account.starting_equity
+        today = Mark(day, account.starting_equity, 0.0, 0.0, 0.0)
     else:
-        mark = account.equity * (1.0 + _mark(account, close, funding, day, rules["cost"]))
+        today = _mark(account, close, funding, day, rules["cost"])
+    mark = today.equity
 
     executed = _decide(rules, close, quote_volume, account, day)
     old = account.weights
@@ -158,11 +188,11 @@ def daily_step(prereg: dict, close, quote_volume, funding, account: Account, day
                                 notional, rules["cost"] * notional))
     new = replace(
         account,
-        cash=mark - sum(t.cost for t in trades),
+        equity_after_costs=mark - sum(t.cost for t in trades),
         weights={c: float(w) for c, w in executed.items() if w != 0.0},
         prev_weights=dict(old),
         last_day=day,
-        equity_history=account.equity_history + [(day, mark)],
+        equity_history=account.equity_history + [today],
         trade_log=account.trade_log + trades,
     )
     return new, trades

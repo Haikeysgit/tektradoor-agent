@@ -106,7 +106,8 @@ def verify_step(path: Path, prereg_sha256: str, judge_tree_hash: str) -> dict:
 
     Refuses unless the prereg is the vendored file, its sha256 equals
     ``prereg_sha256``, HEAD:judge equals ``judge_tree_hash`` (and the prereg's
-    own field), and nothing is uncommitted under judge/ or prereg/.
+    own field), nothing is uncommitted under judge/ or prereg/, and the
+    judge's ``check_integrity`` still passes.
     """
     path = _registered_path(path)
     raw = path.read_bytes()
@@ -122,6 +123,16 @@ def verify_step(path: Path, prereg_sha256: str, judge_tree_hash: str) -> dict:
     dirty = _git(_vendor(), "status", "--porcelain", "--untracked-files=all", "--", "judge", "prereg")
     if dirty:
         raise JudgeTreeMismatch(f"uncommitted changes in the vendored judge: {dirty.splitlines()}")
+    # The judge's own guard as well: the file is still the registered one
+    # (sha256 equals its .sha256, committed once), so a prereg edited and
+    # committed in the submodule is refused even if the account's stored
+    # sha256 was edited to match it.
+    try:
+        J.check_integrity(path)
+    except J.JudgeRefusal as exc:
+        raise PreregNotRegistered(f"{path.name} is not a registered, unedited prereg: {exc}") from exc
+    if J.file_sha256(path) != sha:
+        raise PreregNotRegistered(f"{path.name} changed while it was being verified")
     rules = json.loads(raw)
     missing = [k for k in J.REQUIRED_KEYS if k not in rules]
     if missing:

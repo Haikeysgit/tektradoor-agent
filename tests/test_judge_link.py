@@ -123,3 +123,16 @@ def _pins(path: Path) -> dict[str, str]:
 
 def test_library_pins_match_the_judge():
     assert _pins(ROOT / "requirements.txt") == _pins(VENDOR / "requirements.txt")
+
+
+def test_a_committed_prereg_edit_is_refused_even_with_a_matching_sha(judge_clone):
+    import hashlib
+
+    path = judge_clone / "prereg" / PREREGS[0].name
+    reg = load_prereg(path)
+    path.write_bytes(path.read_bytes().replace(b'"vol_target": 0.25', b'"vol_target": 0.9'))
+    _git(judge_clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "edit prereg")
+    forged = hashlib.sha256(path.read_bytes()).hexdigest()  # an account hand-edited to match
+    assert vendor_tree_hash() == reg.judge_tree_hash  # judge code unchanged, tree clean
+    with pytest.raises(PreregNotRegistered, match="registered"):
+        verify_step(path, forged, reg.judge_tree_hash)

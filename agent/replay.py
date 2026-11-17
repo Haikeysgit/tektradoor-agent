@@ -59,13 +59,17 @@ def summary(account: Account) -> dict:
     }
 
 
-def replay(prereg_path: Path, start: date, end: date, cache_dir: Path | None = None, loader=None) -> Account:
-    """Load the judge's data for the window and replay it. ``loader`` defaults to the judge's."""
+def load_data(market: str, start: date, end: date, cache_dir: Path):
+    """The judge's loader: (close, quote_volume, funding) for every listed symbol."""
+    return J._load_data(market, start, end, cache_dir)
+
+
+def replay(prereg_path: Path, start: date, end: date, cache_dir: Path | None = None) -> Account:
+    """Load the judge's data for the window and replay it."""
     prereg = load_prereg(Path(prereg_path))  # judge validation + judge_tree_hash startup check
     cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
     load_start = start - timedelta(days=J.LOOKBACK_DAYS)
-    loader = loader or J._load_data
-    close, qv, funding = loader(J.MARKET, load_start, end, cache_dir)
+    close, qv, funding = load_data(J.MARKET, load_start, end, cache_dir)
     last = J._data_last_date(close)
     if last < end:
         raise J.DataNotReady(f"data ends {last}, before the window end {end}")
